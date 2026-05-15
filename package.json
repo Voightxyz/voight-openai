@@ -1,6 +1,6 @@
 {
   "name": "@voightxyz/openai",
-  "version": "0.1.0-beta.2",
+  "version": "0.1.0-beta.3",
   "description": "Voight observability for the OpenAI SDK. Wrap your OpenAI client and capture every model call — prompts, tokens, costs, latency, errors — surfaced live in the Voight dashboard.",
   "keywords": [
     "openai",
