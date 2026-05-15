@@ -229,6 +229,136 @@ describe('instrumentChatCompletions — non-streaming', () => {
   })
 })
 
+describe('instrumentChatCompletions — streaming usage injection', () => {
+  /**
+   * OpenAI doesn't send `usage` in streaming chunks unless the
+   * caller opts in via `stream_options.include_usage: true`. We
+   * inject this default when the user enables streaming, so token
+   * capture works without any setup on their side. The user's
+   * explicit choice always wins.
+   */
+  it('auto-injects stream_options.include_usage when streaming and not set', async () => {
+    const { ctx } = makeContext()
+    const seen: ChatCreateParamsCaptured[] = []
+    const wrapped = instrumentChatCompletions(
+      (async (p: ChatCreateParamsCaptured) => {
+        seen.push(p)
+        return (async function* () {
+          yield { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
+        })()
+      }) as never,
+      ctx,
+    )
+
+    const stream = (await wrapped({
+      model: 'gpt-4o-mini',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    })) as AsyncIterable<unknown>
+    for await (const _ of stream) void _
+
+    expect(seen[0]!.stream_options).toEqual({ include_usage: true })
+  })
+
+  it('preserves other stream_options keys when injecting include_usage', async () => {
+    const { ctx } = makeContext()
+    const seen: ChatCreateParamsCaptured[] = []
+    const wrapped = instrumentChatCompletions(
+      (async (p: ChatCreateParamsCaptured) => {
+        seen.push(p)
+        return (async function* () {
+          yield { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
+        })()
+      }) as never,
+      ctx,
+    )
+
+    const stream = (await wrapped({
+      model: 'gpt-4o-mini',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream_options: { some_future_flag: true },
+    } as never)) as AsyncIterable<unknown>
+    for await (const _ of stream) void _
+
+    expect(seen[0]!.stream_options).toEqual({
+      some_future_flag: true,
+      include_usage: true,
+    })
+  })
+
+  it('does NOT override an explicit include_usage: false', async () => {
+    const { ctx } = makeContext()
+    const seen: ChatCreateParamsCaptured[] = []
+    const wrapped = instrumentChatCompletions(
+      (async (p: ChatCreateParamsCaptured) => {
+        seen.push(p)
+        return (async function* () {
+          yield { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
+        })()
+      }) as never,
+      ctx,
+    )
+
+    const stream = (await wrapped({
+      model: 'gpt-4o-mini',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream_options: { include_usage: false },
+    } as never)) as AsyncIterable<unknown>
+    for await (const _ of stream) void _
+
+    expect(seen[0]!.stream_options).toEqual({ include_usage: false })
+  })
+
+  it('does NOT mutate the caller-supplied params object', async () => {
+    const { ctx } = makeContext()
+    const wrapped = instrumentChatCompletions(
+      (async () =>
+        (async function* () {
+          yield { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
+        })()) as never,
+      ctx,
+    )
+
+    const userParams: Record<string, unknown> = {
+      model: 'gpt-4o-mini',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    const stream = (await wrapped(userParams as never)) as AsyncIterable<unknown>
+    for await (const _ of stream) void _
+
+    expect(userParams.stream_options).toBeUndefined()
+  })
+
+  it('does NOT inject anything when stream is false', async () => {
+    const { ctx } = makeContext()
+    const seen: ChatCreateParamsCaptured[] = []
+    const wrapped = instrumentChatCompletions(
+      (async (p: ChatCreateParamsCaptured) => {
+        seen.push(p)
+        return nonStreamingResponse()
+      }) as never,
+      ctx,
+    )
+
+    await wrapped({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    expect(seen[0]!.stream_options).toBeUndefined()
+  })
+})
+
+interface ChatCreateParamsCaptured {
+  model: string
+  messages: unknown[]
+  stream?: boolean
+  stream_options?: Record<string, unknown>
+}
+
 describe('instrumentChatCompletions — streaming', () => {
   async function* mockStream() {
     yield {

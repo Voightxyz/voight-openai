@@ -41,6 +41,7 @@ interface ChatCreateParams {
   model: string
   messages: Array<Record<string, unknown>>
   stream?: boolean
+  stream_options?: Record<string, unknown>
   [k: string]: unknown
 }
 
@@ -102,10 +103,11 @@ export function instrumentChatCompletions(
   return async function wrappedCreate(params: ChatCreateParams) {
     const startedAt = ctx.now()
     const isStream = params.stream === true
+    const effectiveParams = isStream ? withStreamUsage(params) : params
 
     let result: ChatCompletion | AsyncIterable<ChatChunk>
     try {
-      result = await original(params)
+      result = await original(effectiveParams)
     } catch (err) {
       // Record a failure event, then re-throw the original error
       // so the user's error path is unchanged.
@@ -287,6 +289,30 @@ function assembleEvent(args: {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────
+
+/**
+ * Ensure streaming requests opt into `usage` in the final chunk.
+ *
+ * OpenAI's streaming API does not emit `usage` by default — the
+ * caller must pass `stream_options: { include_usage: true }`. We
+ * add this flag for the user so token capture works out of the
+ * box. The user's explicit choice always wins: if they passed
+ * `include_usage: false`, we leave it alone (they'll see "no
+ * tokens" on the event, but it's their decision).
+ *
+ * Returns a fresh params object; the caller-supplied one is never
+ * mutated. Non-streaming params pass through untouched at the
+ * call site.
+ */
+function withStreamUsage(params: ChatCreateParams): ChatCreateParams {
+  const existing =
+    (params.stream_options as Record<string, unknown> | undefined) ?? {}
+  if ('include_usage' in existing) return params
+  return {
+    ...params,
+    stream_options: { ...existing, include_usage: true },
+  }
+}
 
 function firstChoiceContent(r: ChatCompletion): string | undefined {
   const c = r.choices?.[0]?.message?.content
