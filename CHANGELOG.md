@@ -2,7 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0-beta.1] — Unreleased
+## [0.1.0-beta.2] — 2026-05-15
+
+### Added
+
+- Path-A token breakdown: when OpenAI reports cached prompt tokens via `usage.prompt_tokens_details.cached_tokens`, the wrapper now emits them as `metadata.tokens.cache_read`. The field is only present when the cache was actually used (strictly positive) so non-cache events keep a tight payload. Backend pricing engines can apply the OpenAI cache discount against this number directly.
+
+## [0.1.0-beta.1] — 2026-05-15
 
 ### Added
 
