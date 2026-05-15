@@ -316,6 +316,263 @@ describe('instrumentChatCompletions — non-streaming', () => {
   })
 })
 
+describe('instrumentChatCompletions — tool / function calling', () => {
+  /**
+   * OpenAI returns the model's chosen tool calls in two places
+   * depending on transport:
+   *   - non-streaming: `response.choices[0].message.tool_calls`
+   *   - streaming:     accumulated from `chunk.choices[0].delta.tool_calls`,
+   *                     keyed by `index` because multiple calls can be in
+   *                     flight in parallel.
+   *
+   * Shape of each captured entry (after aggregation):
+   *   { id, name, arguments } where `arguments` is the raw JSON string
+   *   produced by the model. We do NOT parse it — invalid JSON is a
+   *   common failure mode and the user's app needs to see the literal
+   *   string for debugging.
+   *
+   * We mirror the first call's name into `toolExecuted` so the
+   * existing audit-log row template (which expects a single tool
+   * label like "Bash" or "Edit") keeps rendering meaningfully for
+   * LLM events.
+   */
+
+  function responseWithToolCalls(
+    toolCalls: Array<{ id: string; name: string; args: string }>,
+  ) {
+    return {
+      id: 'chatcmpl-tool-1',
+      created: 1700000000,
+      model: 'gpt-4o-mini',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: null,
+            tool_calls: toolCalls.map((t) => ({
+              id: t.id,
+              type: 'function' as const,
+              function: { name: t.name, arguments: t.args },
+            })),
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+      usage: {
+        prompt_tokens: 50,
+        completion_tokens: 20,
+        total_tokens: 70,
+      },
+    }
+  }
+
+  it('captures a single non-streaming tool call into metadata.toolCalls', async () => {
+    const { ctx, events } = makeContext({ privacy: 'full' })
+    const wrapped = instrumentChatCompletions(
+      (async () =>
+        responseWithToolCalls([
+          { id: 'call_abc', name: 'get_weather', args: '{"location":"Tokyo"}' },
+        ])) as never,
+      ctx,
+    )
+
+    await wrapped({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'weather in Tokyo?' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'get_weather', description: '...', parameters: {} },
+        },
+      ],
+    } as never)
+    await new Promise((r) => setTimeout(r, 0))
+
+    const e = events[0]!
+    expect(e.metadata?.toolCalls).toEqual([
+      { id: 'call_abc', name: 'get_weather', arguments: '{"location":"Tokyo"}' },
+    ])
+  })
+
+  it('mirrors the first tool call name into toolExecuted (audit-log compat)', async () => {
+    const { ctx, events } = makeContext({ privacy: 'full' })
+    const wrapped = instrumentChatCompletions(
+      (async () =>
+        responseWithToolCalls([
+          { id: 'call_1', name: 'search_docs', args: '{"q":"voight"}' },
+          { id: 'call_2', name: 'fetch_url', args: '{"u":"https://x"}' },
+        ])) as never,
+      ctx,
+    )
+
+    await wrapped({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'find voight docs' }],
+    })
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(events[0]!.toolExecuted).toBe('search_docs')
+    expect((events[0]!.metadata?.toolCalls as unknown[]).length).toBe(2)
+  })
+
+  it('omits toolCalls + toolExecuted when the model does not call a tool', async () => {
+    const { ctx, events } = makeContext({ privacy: 'full' })
+    const wrapped = instrumentChatCompletions(
+      (async () => nonStreamingResponse()) as never,
+      ctx,
+    )
+
+    await wrapped({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(events[0]!.toolExecuted).toBeUndefined()
+    expect(events[0]!.metadata?.toolCalls).toBeUndefined()
+  })
+
+  it('drops toolCalls under privacy=minimal but keeps toolExecuted', async () => {
+    // Under minimal, the name of the tool is fair game (it's a tag,
+    // not user content) so the dashboard can still distinguish "the
+    // agent fetched something" from "the agent did nothing". The
+    // arguments — which can carry user content — must drop.
+    const { ctx, events } = makeContext({ privacy: 'minimal' })
+    const wrapped = instrumentChatCompletions(
+      (async () =>
+        responseWithToolCalls([
+          { id: 'c1', name: 'send_email', args: '{"to":"user@example.com"}' },
+        ])) as never,
+      ctx,
+    )
+
+    await wrapped({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'send mail' }],
+    })
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(events[0]!.toolExecuted).toBe('send_email')
+    expect(events[0]!.metadata?.toolCalls).toBeUndefined()
+  })
+
+  it('scrubs PII inside tool arguments under privacy=standard', async () => {
+    const { ctx, events } = makeContext({ privacy: 'standard' })
+    const wrapped = instrumentChatCompletions(
+      (async () =>
+        responseWithToolCalls([
+          {
+            id: 'c1',
+            name: 'send_email',
+            args: '{"to":"jane@acme.io","subject":"hi"}',
+          },
+        ])) as never,
+      ctx,
+    )
+
+    await wrapped({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'send mail' }],
+    })
+    await new Promise((r) => setTimeout(r, 0))
+
+    const calls = events[0]!.metadata?.toolCalls as Array<{ arguments: string }>
+    expect(calls[0]!.arguments).toContain('[REDACTED-EMAIL]')
+    expect(calls[0]!.arguments).not.toContain('jane@acme.io')
+  })
+
+  it('aggregates streaming tool_calls deltas by index into a single entry', async () => {
+    /**
+     * Real-world OpenAI streaming pattern: first chunk for a tool
+     * carries id + type + function.name, subsequent chunks append
+     * to function.arguments in fragments. Our aggregator must keep
+     * one entry per `index` and concatenate the arg fragments in
+     * arrival order.
+     */
+    async function* mockToolStream() {
+      yield {
+        id: 'chatcmpl-s1',
+        created: 1700000000,
+        model: 'gpt-4o-mini',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_stream',
+                  type: 'function',
+                  function: { name: 'get_weather', arguments: '' },
+                },
+              ],
+            },
+          },
+        ],
+      }
+      yield {
+        id: 'chatcmpl-s1',
+        created: 1700000000,
+        model: 'gpt-4o-mini',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [{ index: 0, function: { arguments: '{"loc' } }],
+            },
+          },
+        ],
+      }
+      yield {
+        id: 'chatcmpl-s1',
+        created: 1700000000,
+        model: 'gpt-4o-mini',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                { index: 0, function: { arguments: 'ation":"Tokyo"}' } },
+              ],
+            },
+          },
+        ],
+      }
+      yield {
+        id: 'chatcmpl-s1',
+        created: 1700000000,
+        model: 'gpt-4o-mini',
+        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+        usage: { prompt_tokens: 50, completion_tokens: 20, total_tokens: 70 },
+      }
+    }
+
+    const { ctx, events } = makeContext({ privacy: 'full' })
+    const wrapped = instrumentChatCompletions(
+      (async () => mockToolStream()) as never,
+      ctx,
+    )
+
+    const stream = (await wrapped({
+      model: 'gpt-4o-mini',
+      stream: true,
+      messages: [{ role: 'user', content: 'weather' }],
+    })) as AsyncIterable<unknown>
+    for await (const _ of stream) void _
+
+    await new Promise((r) => setTimeout(r, 0))
+    expect(events[0]!.toolExecuted).toBe('get_weather')
+    expect(events[0]!.metadata?.toolCalls).toEqual([
+      {
+        id: 'call_stream',
+        name: 'get_weather',
+        arguments: '{"location":"Tokyo"}',
+      },
+    ])
+  })
+})
+
 describe('instrumentChatCompletions — streaming usage injection', () => {
   /**
    * OpenAI doesn't send `usage` in streaming chunks unless the

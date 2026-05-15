@@ -45,10 +45,48 @@ interface ChatCreateParams {
   [k: string]: unknown
 }
 
+/**
+ * Per-tool-call shape after we aggregate streaming deltas. Mirrors
+ * the non-streaming `message.tool_calls[*]` shape but flattened
+ * (no nested `function` namespace) so consumers don't need to know
+ * which transport produced the event.
+ */
+interface CapturedToolCall {
+  id: string
+  name: string
+  arguments: string
+}
+
+/**
+ * Streaming chunk shape for a single tool-call delta. OpenAI emits
+ * one of these per chunk per parallel tool call. The first chunk
+ * for a given `index` carries `id` + `function.name`; subsequent
+ * chunks append fragments to `function.arguments`.
+ */
+interface ToolCallDelta {
+  index: number
+  id?: string
+  type?: 'function'
+  function?: {
+    name?: string
+    arguments?: string
+  }
+}
+
 interface ChatChoice {
-  message?: { content?: string | null }
+  message?: {
+    content?: string | null
+    tool_calls?: Array<{
+      id: string
+      type: 'function'
+      function: { name: string; arguments: string }
+    }>
+  }
   finish_reason?: string | null
-  delta?: { content?: string | null }
+  delta?: {
+    content?: string | null
+    tool_calls?: ToolCallDelta[]
+  }
   [k: string]: unknown
 }
 
@@ -171,6 +209,7 @@ function buildSuccessEvent(args: {
   const durationMs = ctx.now() - startedAt
   const responseText = firstChoiceContent(response)
   const tokens = normaliseTokens(response.usage)
+  const toolCalls = extractToolCallsFromMessage(response)
 
   return assembleEvent({
     ctx,
@@ -179,6 +218,7 @@ function buildSuccessEvent(args: {
     outcome: 'success',
     responseText,
     tokens,
+    toolCalls,
     streaming: false,
     finishReason: response.choices?.[0]?.finish_reason ?? null,
     modelFromResponse: response.model,
@@ -211,11 +251,21 @@ function buildStreamEvent(args: {
   params: ChatCreateParams
   startedAt: number
   aggregated: string
-  tokens: { input: number; output: number; total: number } | null
+  tokens: NormalisedTokens | null
+  toolCalls: CapturedToolCall[] | null
   modelFromResponse: string | undefined
   finishReason: string | null
 }): EventPayload {
-  const { ctx, params, startedAt, aggregated, tokens, modelFromResponse, finishReason } = args
+  const {
+    ctx,
+    params,
+    startedAt,
+    aggregated,
+    tokens,
+    toolCalls,
+    modelFromResponse,
+    finishReason,
+  } = args
   return assembleEvent({
     ctx,
     params,
@@ -223,6 +273,7 @@ function buildStreamEvent(args: {
     outcome: 'success',
     responseText: aggregated.length > 0 ? aggregated : undefined,
     tokens,
+    toolCalls,
     streaming: true,
     finishReason,
     modelFromResponse,
@@ -239,7 +290,8 @@ function assembleEvent(args: {
   durationMs: number
   outcome: 'success' | 'failed'
   responseText?: string | undefined
-  tokens?: { input: number; output: number; total: number } | null
+  tokens?: NormalisedTokens | null
+  toolCalls?: CapturedToolCall[] | null
   streaming: boolean
   finishReason?: string | null
   errorMessage?: string
@@ -248,6 +300,7 @@ function assembleEvent(args: {
   const { ctx, params, durationMs, outcome, streaming, errorMessage } = args
   const responseText = args.responseText
   const tokens = args.tokens ?? null
+  const toolCalls = args.toolCalls ?? null
   const model = args.modelFromResponse ?? params.model
 
   const metadata: Record<string, unknown> = {
@@ -260,16 +313,25 @@ function assembleEvent(args: {
     metadata.finishReason = args.finishReason
   }
 
+  // First tool-call name flows into `toolExecuted` for audit-log
+  // compat regardless of privacy level. The name itself is a tag
+  // (function-name, not user content), so even Minimal mode emits
+  // it so the dashboard can show "agent did X" vs "agent did
+  // nothing".
+  const firstToolName = toolCalls && toolCalls.length > 0 ? toolCalls[0]!.name : undefined
+
   // Privacy: response text + messages
   if (ctx.privacy === 'minimal') {
     // Drop content entirely. metadata.tokens / streaming / source
-    // already set above. Return early with no input + no responseText.
+    // already set above. Return early with no input + no responseText
+    // and no tool arguments (which can carry user data).
     return {
       agentId: ctx.agentId,
       type: 'reasoning',
       model,
       durationMs,
       outcome,
+      ...(firstToolName ? { toolExecuted: firstToolName } : {}),
       metadata,
       ...(errorMessage ? { errorMessage } : {}),
     }
@@ -293,12 +355,26 @@ function assembleEvent(args: {
     metadata.responseText = scrubbedResponse
   }
 
+  if (toolCalls && toolCalls.length > 0) {
+    // Tool arguments can contain user content (emails, queries,
+    // ids…). Scrub them at standard, pass through at full.
+    metadata.toolCalls =
+      ctx.privacy === 'standard'
+        ? toolCalls.map((t) => ({
+            id: t.id,
+            name: t.name,
+            arguments: scrubPii(t.arguments),
+          }))
+        : toolCalls
+  }
+
   return {
     agentId: ctx.agentId,
     type: 'reasoning',
     model,
     durationMs,
     outcome,
+    ...(firstToolName ? { toolExecuted: firstToolName } : {}),
     input: { messages },
     metadata,
     ...(errorMessage ? { errorMessage } : {}),
@@ -336,6 +412,85 @@ function firstChoiceContent(r: ChatCompletion): string | undefined {
   return typeof c === 'string' ? c : undefined
 }
 
+/**
+ * Pull tool calls off a non-streaming response and flatten the shape
+ * (drop the nested `function` namespace) so consumers don't care
+ * which transport produced the event. Returns `null` when no tool
+ * was called — keeps the call-site branch readable.
+ */
+function extractToolCallsFromMessage(
+  r: ChatCompletion,
+): CapturedToolCall[] | null {
+  const raw = r.choices?.[0]?.message?.tool_calls
+  if (!raw || raw.length === 0) return null
+  const out: CapturedToolCall[] = []
+  for (const tc of raw) {
+    if (!tc || tc.type !== 'function' || !tc.function) continue
+    out.push({
+      id: typeof tc.id === 'string' ? tc.id : '',
+      name: typeof tc.function.name === 'string' ? tc.function.name : '',
+      arguments:
+        typeof tc.function.arguments === 'string' ? tc.function.arguments : '',
+    })
+  }
+  return out.length > 0 ? out : null
+}
+
+/**
+ * Mutating accumulator for streaming tool-call deltas. OpenAI emits
+ * one entry per parallel tool call, keyed by `index`. The first
+ * delta for an index carries `id` + `function.name`; subsequent
+ * deltas only append fragments to `function.arguments`. We mutate
+ * the `acc` map in place because the stream wrapper holds the
+ * single source of truth across chunks.
+ */
+function applyToolCallDeltas(
+  acc: Map<number, CapturedToolCall>,
+  deltas: ToolCallDelta[] | undefined,
+): void {
+  if (!deltas || deltas.length === 0) return
+  for (const d of deltas) {
+    if (typeof d.index !== 'number') continue
+    let entry = acc.get(d.index)
+    if (!entry) {
+      entry = { id: '', name: '', arguments: '' }
+      acc.set(d.index, entry)
+    }
+    if (typeof d.id === 'string' && d.id.length > 0 && entry.id.length === 0) {
+      entry.id = d.id
+    }
+    if (
+      typeof d.function?.name === 'string' &&
+      d.function.name.length > 0 &&
+      entry.name.length === 0
+    ) {
+      entry.name = d.function.name
+    }
+    if (typeof d.function?.arguments === 'string') {
+      entry.arguments += d.function.arguments
+    }
+  }
+}
+
+/**
+ * Snapshot the accumulator into the wire-shape ordered array. We
+ * sort by `index` so consumers see the same order the model
+ * produced (matters when the dashboard renders a list and humans
+ * are debugging an interleaved trace).
+ */
+function snapshotToolCalls(
+  acc: Map<number, CapturedToolCall>,
+): CapturedToolCall[] | null {
+  if (acc.size === 0) return null
+  const entries = [...acc.entries()].sort(([a], [b]) => a - b)
+  // Drop any leftover stubs that never received a name (shouldn't
+  // happen in practice — OpenAI always emits name in the first
+  // chunk for each index — but defensive in case of a partial
+  // stream that was aborted mid-call).
+  const out = entries.map(([, v]) => v).filter((t) => t.name.length > 0)
+  return out.length > 0 ? out : null
+}
+
 function normaliseTokens(u: ChatUsage | undefined): NormalisedTokens | null {
   if (!u) return null
   const input = numberOrZero(u.prompt_tokens)
@@ -368,9 +523,10 @@ function wrapStream(
   startedAt: number,
 ): AsyncIterable<ChatChunk> {
   let aggregated = ''
-  let tokens: { input: number; output: number; total: number } | null = null
+  let tokens: NormalisedTokens | null = null
   let modelFromResponse: string | undefined
   let finishReason: string | null = null
+  const toolCallsAcc = new Map<number, CapturedToolCall>()
   let emitted = false
 
   function emit() {
@@ -383,6 +539,7 @@ function wrapStream(
         startedAt,
         aggregated,
         tokens,
+        toolCalls: snapshotToolCalls(toolCallsAcc),
         modelFromResponse,
         finishReason,
       }),
@@ -403,6 +560,9 @@ function wrapStream(
             finishReason = choice.finish_reason ?? null
           }
           if (chunk.usage) tokens = normaliseTokens(chunk.usage)
+          // Tool-call deltas arrive interleaved with content deltas;
+          // an `index` keys multiple parallel tool calls.
+          applyToolCallDeltas(toolCallsAcc, choice?.delta?.tool_calls)
           yield chunk
         }
       } catch (err) {

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.0-beta.3] — 2026-05-15
+
+### Added
+
+- Tool / function calling capture. When the model returns one or more tool calls, the wrapper now emits `metadata.toolCalls: [{ id, name, arguments }]` and mirrors the first tool's name into the top-level `toolExecuted` field (audit-log compat with hook events). Works for both non-streaming responses and streaming deltas — the streaming aggregator keys per-tool entries by `index` and concatenates argument fragments in arrival order.
+- Privacy fan-out for tool calls: under `minimal`, only `toolExecuted` (the function name, a tag not user content) survives; the arguments — which can carry user data — drop entirely. Under `standard`, arguments are scrubbed against the same 12 PII patterns the rest of the payload uses. Under `full`, arguments pass through verbatim.
+
 ## [0.1.0-beta.2] — 2026-05-15
 
 ### Added
