@@ -1,0 +1,65 @@
+{
+  "name": "@voightxyz/openai",
+  "version": "0.1.0-beta.1",
+  "description": "Voight observability for the OpenAI SDK. Wrap your OpenAI client and capture every model call — prompts, tokens, costs, latency, errors — surfaced live in the Voight dashboard.",
+  "keywords": [
+    "openai",
+    "observability",
+    "ai-agents",
+    "voight",
+    "llm",
+    "monitoring",
+    "instrumentation"
+  ],
+  "homepage": "https://voight.xyz",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voightxyz/voight-openai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/voightxyz/voight-openai/issues"
+  },
+  "license": "Apache-2.0",
+  "author": "Voight (https://voight.xyz)",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "openai": ">=4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "openai": "^4.77.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.5"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta"
+  }
+}
