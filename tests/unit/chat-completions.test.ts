@@ -133,6 +133,93 @@ describe('instrumentChatCompletions — non-streaming', () => {
     })
   })
 
+  it('captures cache_read when prompt_tokens_details.cached_tokens is present', async () => {
+    /**
+     * OpenAI auto-caches prompts >1024 tokens. The cached portion is
+     * reported back in `usage.prompt_tokens_details.cached_tokens`
+     * (verified against the official @types/openai bundled
+     * declarations 2026-05-15). Path-A pricing requires that this
+     * portion be tracked separately so consumers (and the backend
+     * cost engine) can apply the OpenAI cache discount.
+     */
+    const { ctx, events } = makeContext()
+    const responseWithCache = nonStreamingResponse({
+      usage: {
+        prompt_tokens: 1500,
+        completion_tokens: 200,
+        total_tokens: 1700,
+        prompt_tokens_details: {
+          cached_tokens: 1024,
+        },
+      },
+    })
+    const wrapped = instrumentChatCompletions(
+      (async () => responseWithCache) as never,
+      ctx,
+    )
+
+    await wrapped({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'long prompt here' }],
+    })
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(events[0]!.metadata?.tokens).toEqual({
+      input: 1500,
+      output: 200,
+      total: 1700,
+      cache_read: 1024,
+    })
+  })
+
+  it('omits cache_read when prompt_tokens_details is absent', async () => {
+    // Backwards-compatibility: pre-cache-aware OpenAI responses (or
+    // models that don't cache) must still produce a clean event with
+    // no spurious `cache_read: 0` noise.
+    const { ctx, events } = makeContext()
+    const wrapped = instrumentChatCompletions(
+      (async () => nonStreamingResponse()) as never,
+      ctx,
+    )
+
+    await wrapped({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(events[0]!.metadata?.tokens).not.toHaveProperty('cache_read')
+  })
+
+  it('omits cache_read when cached_tokens is zero', async () => {
+    // Even when the details object is present, a `cached_tokens: 0`
+    // value is informationally identical to "no cache used" and we
+    // skip it to keep the metadata payload tight.
+    const { ctx, events } = makeContext()
+    const responseNoCacheHit = nonStreamingResponse({
+      usage: {
+        prompt_tokens: 12,
+        completion_tokens: 5,
+        total_tokens: 17,
+        prompt_tokens_details: {
+          cached_tokens: 0,
+        },
+      },
+    })
+    const wrapped = instrumentChatCompletions(
+      (async () => responseNoCacheHit) as never,
+      ctx,
+    )
+
+    await wrapped({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(events[0]!.metadata?.tokens).not.toHaveProperty('cache_read')
+  })
+
   it('under privacy=full, includes messages + responseText', async () => {
     const { ctx, events } = makeContext({ privacy: 'full' })
     const wrapped = instrumentChatCompletions(
@@ -405,6 +492,56 @@ describe('instrumentChatCompletions — streaming', () => {
       if (c !== undefined) seen.push(c)
     }
     expect(seen).toEqual(['hel', 'lo'])
+  })
+
+  it('captures cache_read from the streaming usage chunk when present', async () => {
+    /**
+     * Mirror of the non-streaming cache test for the streaming path:
+     * the final chunk's `usage.prompt_tokens_details.cached_tokens`
+     * must land on `metadata.tokens.cache_read` so Path-A pricing
+     * works the same for both transports.
+     */
+    async function* mockStreamWithCache() {
+      yield {
+        id: 'chatcmpl-cache-1',
+        created: 1700000000,
+        model: 'gpt-4o-mini',
+        choices: [{ index: 0, delta: { content: 'ok' } }],
+      }
+      yield {
+        id: 'chatcmpl-cache-1',
+        created: 1700000000,
+        model: 'gpt-4o-mini',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        usage: {
+          prompt_tokens: 1500,
+          completion_tokens: 200,
+          total_tokens: 1700,
+          prompt_tokens_details: { cached_tokens: 1024 },
+        },
+      }
+    }
+
+    const { ctx, events } = makeContext({ privacy: 'full' })
+    const wrapped = instrumentChatCompletions(
+      (async () => mockStreamWithCache()) as never,
+      ctx,
+    )
+
+    const stream = (await wrapped({
+      model: 'gpt-4o-mini',
+      stream: true,
+      messages: [{ role: 'user', content: 'long prompt' }],
+    })) as AsyncIterable<unknown>
+    for await (const _ of stream) void _
+
+    await new Promise((r) => setTimeout(r, 0))
+    expect(events[0]!.metadata?.tokens).toEqual({
+      input: 1500,
+      output: 200,
+      total: 1700,
+      cache_read: 1024,
+    })
   })
 
   it('emits a single event with aggregated response after the stream ends', async () => {

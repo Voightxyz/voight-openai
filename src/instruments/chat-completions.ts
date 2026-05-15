@@ -56,7 +56,24 @@ interface ChatUsage {
   prompt_tokens?: number
   completion_tokens?: number
   total_tokens?: number
+  prompt_tokens_details?: {
+    cached_tokens?: number
+    [k: string]: unknown
+  }
   [k: string]: unknown
+}
+
+/**
+ * Token shape we emit on `metadata.tokens`. `cache_read` is optional
+ * and only present when the response actually reports cached input
+ * tokens (`prompt_tokens_details.cached_tokens > 0`). This keeps the
+ * payload tight for the >99% of calls that don't hit the cache.
+ */
+interface NormalisedTokens {
+  input: number
+  output: number
+  total: number
+  cache_read?: number
 }
 
 interface ChatCompletion {
@@ -319,13 +336,22 @@ function firstChoiceContent(r: ChatCompletion): string | undefined {
   return typeof c === 'string' ? c : undefined
 }
 
-function normaliseTokens(
-  u: ChatUsage | undefined,
-): { input: number; output: number; total: number } | null {
+function normaliseTokens(u: ChatUsage | undefined): NormalisedTokens | null {
   if (!u) return null
   const input = numberOrZero(u.prompt_tokens)
   const output = numberOrZero(u.completion_tokens)
   const total = numberOrZero(u.total_tokens) || input + output
+  // Path-A breakdown: OpenAI reports the cached portion of the
+  // prompt under `prompt_tokens_details.cached_tokens` (auto-applied
+  // by the platform to prompts ≥1024 tokens). We only emit
+  // `cache_read` when it's strictly positive — a zero is informationally
+  // identical to "no cache hit" and bloats the payload.
+  const cachedRaw = u.prompt_tokens_details?.cached_tokens
+  const cached =
+    typeof cachedRaw === 'number' && Number.isFinite(cachedRaw) ? cachedRaw : 0
+  if (cached > 0) {
+    return { input, output, total, cache_read: cached }
+  }
   return { input, output, total }
 }
 
