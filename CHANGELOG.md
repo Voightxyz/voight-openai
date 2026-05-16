@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.0] — 2026-05-16
+
+First stable release. Consolidates beta.1 through beta.5.
+
+### Capabilities
+
+- `wrapOpenAI(client, options)` — three-layer Proxy (`client → chat → completions → create`) plus a sibling layer for `client.responses.create`. Everything outside the instrumented paths passes through untouched.
+- Chat Completions surface: non-streaming + streaming `chat.completions.create`. Streaming auto-injects `stream_options.include_usage: true` so token counts always land. Tool / function calling captured for both transports, with streaming `tool_calls` deltas aggregated by `index`.
+- Responses API surface: non-streaming + streaming `responses.create`. State machine over the typed event union handles text deltas, function-call argument fragments, and final usage from `response.completed`. Events from this surface carry `metadata.api: 'responses'` so dashboards can distinguish the call site (chat-completions events omit the field).
+- Token capture: `input` / `output` / `total` always present. `cache_read` from `prompt_tokens_details.cached_tokens` when positive. `reasoning` from `output_tokens_details.reasoning_tokens` when positive (o1, o3, future reasoning models).
+- `sessionId` emission: each wrapper instance resolves a UUID v4 once (or accepts an explicit override) and stamps it on `metadata.sessionId` for every event. Dashboards group events sharing a sessionId into a single trace timeline.
+- Three-level privacy redaction (`minimal` / `standard` / `full`) over prompts, response text, and tool arguments via a 12-pattern catalogue: PEM private keys, JWTs, Anthropic / OpenAI / Stripe live / GitHub / AWS / Slack / Voight API keys, emails, E.164 phones, and Luhn-validated credit cards. Function-call names always survive as tags.
+- Fire-and-forget HTTP ingest to `https://api.voight.xyz/v1/events`. Never throws, never blocks the caller. `onError` hook for development.
+- API key + agent identity resolution: `voightApiKey` option → `VOIGHT_KEY` env → `null`. `agent` option → `VOIGHT_AGENT` env → `HOSTNAME` env → `'unknown-agent'`.
+- Non-fatal failure modes: `enabled: false` and missing API key both return the original client untouched.
+
+### Tests
+
+- 89 unit tests across privacy, identity, ingest, chat-completions, responses, and wrap surfaces. All green.
+- End-to-end smoke verified against real OpenAI + real Voight backend: text, streaming text, tool calls (both surfaces), `cache_read` on cached prompts, `metadata.api` discrimination.
+
 ## [0.1.0-beta.5] — 2026-05-16
 
 ### Added
