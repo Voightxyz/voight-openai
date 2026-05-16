@@ -139,6 +139,12 @@ export interface EventSink {
 export interface InstrumentContext {
   agentId: string
   privacy: PrivacyLevel
+  /**
+   * Trace grouping identifier stamped on every emitted event under
+   * `metadata.sessionId`. The wrapper resolves it once per instance
+   * (explicit option or auto-generated UUID v4).
+   */
+  sessionId: string
   ingest: EventSink
   /**
    * Time source in milliseconds since the epoch. Injected so tests
@@ -307,6 +313,7 @@ function assembleEvent(args: {
     source: 'openai-sdk',
     privacyLevel: ctx.privacy,
     streaming,
+    sessionId: ctx.sessionId,
   }
   if (tokens) metadata.tokens = tokens
   if (args.finishReason !== undefined && args.finishReason !== null) {
