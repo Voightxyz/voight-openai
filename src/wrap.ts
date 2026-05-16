@@ -34,6 +34,7 @@ import {
   instrumentChatCompletions,
   type InstrumentContext,
 } from './instruments/chat-completions.js'
+import { instrumentResponses } from './instruments/responses.js'
 
 interface InternalOptions extends WrapOptions {
   _fetch?: typeof fetch
@@ -101,6 +102,30 @@ export function wrapOpenAI<T extends object>(
       if (prop === 'chat') {
         const chat = Reflect.get(target, prop, receiver)
         return wrapChat(chat as object, ctx)
+      }
+      if (prop === 'responses') {
+        const responses = Reflect.get(target, prop, receiver)
+        return wrapResponses(responses as object, ctx)
+      }
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+}
+
+function wrapResponses<R extends object>(
+  responses: R,
+  ctx: InstrumentContext,
+): R {
+  return new Proxy(responses, {
+    get(target, prop, receiver) {
+      if (prop === 'create') {
+        const original = Reflect.get(target, prop, receiver) as (
+          params: never,
+        ) => Promise<unknown>
+        return instrumentResponses(
+          original.bind(target) as never,
+          ctx,
+        )
       }
       return Reflect.get(target, prop, receiver)
     },
