@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.0-beta.5] — 2026-05-16
+
+### Added
+
+- Responses API support. The wrapper now intercepts `client.responses.create` in addition to `client.chat.completions.create`. Same event shape, same privacy model, same dashboard target — events from the new Responses surface land alongside chat-completions events under the same agent. Events carry `metadata.api: 'responses'` so the dashboard can distinguish call sites; chat-completions events omit the field (preserving the existing surface).
+- Non-streaming capture: pulls text from `response.output_text` (or aggregates from `output[].message.content[]`), flattens function calls from `output[].function_call` items into `metadata.toolCalls` with the same `{ id, name, arguments }` shape produced by chat-completions.
+- Streaming capture: state machine over the typed event union (`response.created`, `response.output_text.delta`, `response.output_item.added`, `response.function_call_arguments.delta`, `response.completed`, plus error/incomplete terminal states). Other event types in the 60+ union (audio, web_search, file_search, code_interpreter, image_gen, MCP, …) pass through untouched and do not affect capture.
+- Reasoning-token capture: when `usage.output_tokens_details.reasoning_tokens > 0` (o1, o3, future reasoning models), the wrapper surfaces it as `metadata.tokens.reasoning` so cost analysis can separate visible-answer cost from "thinking" overhead.
+
 ## [0.1.0-beta.4] — 2026-05-16
 
 ### Added
