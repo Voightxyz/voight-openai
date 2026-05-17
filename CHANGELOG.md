@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5] — 2026-05-17
+
+Trace-level observability primitives — the dashboard's AI Apps trace drill-down (span tree, Logs sub-tab, endpoint grouping, parent links) now has real data to draw on.
+
+### Added
+
+- **`withTrace(fn, options?)`** — opens an `AsyncLocalStorage` frame for the lifetime of `fn` so log lines and nested wrapper calls bind to the same trace. Optional `routeTag` overrides the wrapper-level value for this trace only — convenient for per-request endpoint tagging without re-wrapping the client.
+- **`log(message, options?)`** — appends a structured line (`{ ts, level, message }`) to the active trace's log buffer. The next wrapped call drains the buffer into `metadata.logs` so the dashboard's Logs sub-tab on the trace drill-down stays scoped to "what happened around this call". No-op (silent drop) when called outside `withTrace`.
+- **`WrapOptions.routeTag`** — application-level endpoint / job tag stamped on `metadata.endpoint` of every event from this wrapper instance. Lets the dashboard group calls by user-facing surface (`POST /api/chat`, `cron:nightly-rollup`, …). Trace-level override wins when both are set.
+- **Span tree** — every event now carries `metadata.spanId` (UUID v4 per intercepted call). Nested wrapped calls during another wrapped call's execution land with `metadata.parentSpanId` pointing at the enclosing call's span. The dashboard renders these as a tree on the trace drill-down.
+
+### Tests
+
+- 22 new unit tests covering the context layer (pure helpers + integration with the chat-completions instrument): outside-trace no-ops, frame isolation across nested `withTrace`, log buffer drain semantics, `pushSpanAndRun` restore-on-throw, parent-span propagation from outer wrapped calls to nested ones, and `routeTag` precedence (trace > wrapper).
+- 111/111 tests green (was 89).
+
+### Compatibility
+
+Fully backward-compatible with `0.1.0`. New fields are additive on `metadata`; callers that don't adopt `withTrace` / `log` / `routeTag` see no change in event shape beyond the always-present `metadata.spanId`.
+
 ## [0.1.0] — 2026-05-16
 
 First stable release. Consolidates beta.1 through beta.5.

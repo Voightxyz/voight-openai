@@ -27,8 +27,15 @@
  *                   timing, and outcome reach the event.
  */
 
+import { randomUUID } from 'node:crypto'
+
 import type { EventPayload, PrivacyLevel } from '../types.js'
 import { scrubAnyValue, scrubPii } from '../privacy.js'
+import {
+  drainTraceLogs,
+  getCurrentTrace,
+  pushSpanAndRun,
+} from '../context.js'
 
 // ─── Loose OpenAI types ───────────────────────────────────────────
 //
@@ -145,12 +152,44 @@ export interface InstrumentContext {
    * (explicit option or auto-generated UUID v4).
    */
   sessionId: string
+  /**
+   * Optional route / job / endpoint tag stamped on `metadata.endpoint`.
+   * Lets the dashboard group calls by user-facing endpoint without
+   * the wrapper having to introspect HTTP context. Undefined when
+   * the caller didn't supply `routeTag` in {@link WrapOptions}.
+   */
+  routeTag?: string
   ingest: EventSink
   /**
    * Time source in milliseconds since the epoch. Injected so tests
    * can produce deterministic `durationMs` values.
    */
   now: () => number
+}
+
+/**
+ * Resolved span context for a single intercepted call. Generated
+ * once per `wrappedCreate` invocation and threaded through every
+ * event builder so spanId / parentSpanId / endpoint stay consistent
+ * across success / failure / streaming.
+ */
+interface SpanInfo {
+  spanId: string
+  parentSpanId?: string
+  endpoint?: string
+}
+
+/**
+ * Build a SpanInfo by reading the current trace frame (if any) and
+ * resolving the endpoint with trace-level overriding wrapper-level.
+ */
+function captureSpanInfo(ctx: InstrumentContext): SpanInfo {
+  const trace = getCurrentTrace()
+  return {
+    spanId: randomUUID(),
+    parentSpanId: trace?.currentSpanId,
+    endpoint: trace?.routeTag ?? ctx.routeTag,
+  }
 }
 
 /**
@@ -165,41 +204,53 @@ export function instrumentChatCompletions(
     const startedAt = ctx.now()
     const isStream = params.stream === true
     const effectiveParams = isStream ? withStreamUsage(params) : params
+    const span = captureSpanInfo(ctx)
 
-    let result: ChatCompletion | AsyncIterable<ChatChunk>
+    // Non-streaming path: run the await + emit inside pushSpanAndRun
+    // so nested wrapped calls during this call (e.g., a tool invoked
+    // from a multi-turn agent) see this call as their parent.
+    if (!isStream) {
+      return pushSpanAndRun(span.spanId, async () => {
+        let result: ChatCompletion
+        try {
+          result = (await original(effectiveParams)) as ChatCompletion
+        } catch (err) {
+          ctx.ingest.send(
+            buildFailureEvent({ ctx, params, startedAt, error: err, span }),
+          )
+          throw err
+        }
+        ctx.ingest.send(
+          buildSuccessEvent({ ctx, params, startedAt, response: result, span }),
+        )
+        return result
+      })
+    }
+
+    // Streaming path: we can't run the user's `for await` loop inside
+    // pushSpanAndRun (the iteration happens in their code, outside
+    // ours), so we manually mark currentSpanId for the duration of
+    // the stream and restore it when the iterator finishes or throws.
+    // Nested wrapped calls during the user's iteration see the right
+    // parent; restoration is finally-safe.
+    const trace = getCurrentTrace()
+    const previousSpanId = trace?.currentSpanId
+    if (trace) trace.currentSpanId = span.spanId
+
+    let result: AsyncIterable<ChatChunk>
     try {
-      result = await original(effectiveParams)
+      result = (await original(effectiveParams)) as AsyncIterable<ChatChunk>
     } catch (err) {
-      // Record a failure event, then re-throw the original error
-      // so the user's error path is unchanged.
+      if (trace) trace.currentSpanId = previousSpanId
       ctx.ingest.send(
-        buildFailureEvent({
-          ctx,
-          params,
-          startedAt,
-          error: err,
-        }),
+        buildFailureEvent({ ctx, params, startedAt, error: err, span }),
       )
       throw err
     }
 
-    if (!isStream) {
-      ctx.ingest.send(
-        buildSuccessEvent({
-          ctx,
-          params,
-          startedAt,
-          response: result as ChatCompletion,
-        }),
-      )
-      return result
-    }
-
-    // Streaming: tap the iterator. We must NOT consume chunks
-    // ourselves — the user is iterating. We forward each chunk
-    // and accumulate locally; the event lands when the user's
-    // for-await loop finishes (or after the iterator throws).
-    return wrapStream(result as AsyncIterable<ChatChunk>, ctx, params, startedAt)
+    return wrapStream(result, ctx, params, startedAt, span, () => {
+      if (trace) trace.currentSpanId = previousSpanId
+    })
   }
 }
 
@@ -210,8 +261,9 @@ function buildSuccessEvent(args: {
   params: ChatCreateParams
   startedAt: number
   response: ChatCompletion
+  span: SpanInfo
 }): EventPayload {
-  const { ctx, params, startedAt, response } = args
+  const { ctx, params, startedAt, response, span } = args
   const durationMs = ctx.now() - startedAt
   const responseText = firstChoiceContent(response)
   const tokens = normaliseTokens(response.usage)
@@ -220,6 +272,7 @@ function buildSuccessEvent(args: {
   return assembleEvent({
     ctx,
     params,
+    span,
     durationMs,
     outcome: 'success',
     responseText,
@@ -236,8 +289,9 @@ function buildFailureEvent(args: {
   params: ChatCreateParams
   startedAt: number
   error: unknown
+  span: SpanInfo
 }): EventPayload {
-  const { ctx, params, startedAt, error } = args
+  const { ctx, params, startedAt, error, span } = args
   const durationMs = ctx.now() - startedAt
   const message =
     error instanceof Error ? error.message : String(error)
@@ -245,6 +299,7 @@ function buildFailureEvent(args: {
   return assembleEvent({
     ctx,
     params,
+    span,
     durationMs,
     outcome: 'failed',
     streaming: params.stream === true,
@@ -261,6 +316,7 @@ function buildStreamEvent(args: {
   toolCalls: CapturedToolCall[] | null
   modelFromResponse: string | undefined
   finishReason: string | null
+  span: SpanInfo
 }): EventPayload {
   const {
     ctx,
@@ -271,10 +327,12 @@ function buildStreamEvent(args: {
     toolCalls,
     modelFromResponse,
     finishReason,
+    span,
   } = args
   return assembleEvent({
     ctx,
     params,
+    span,
     durationMs: ctx.now() - startedAt,
     outcome: 'success',
     responseText: aggregated.length > 0 ? aggregated : undefined,
@@ -293,6 +351,7 @@ function buildStreamEvent(args: {
 function assembleEvent(args: {
   ctx: InstrumentContext
   params: ChatCreateParams
+  span: SpanInfo
   durationMs: number
   outcome: 'success' | 'failed'
   responseText?: string | undefined
@@ -303,7 +362,7 @@ function assembleEvent(args: {
   errorMessage?: string
   modelFromResponse?: string | undefined
 }): EventPayload {
-  const { ctx, params, durationMs, outcome, streaming, errorMessage } = args
+  const { ctx, params, span, durationMs, outcome, streaming, errorMessage } = args
   const responseText = args.responseText
   const tokens = args.tokens ?? null
   const toolCalls = args.toolCalls ?? null
@@ -314,7 +373,18 @@ function assembleEvent(args: {
     privacyLevel: ctx.privacy,
     streaming,
     sessionId: ctx.sessionId,
+    // Span tree fields — populated even when no withTrace boundary is
+    // in scope so the dashboard always has a stable span identity to
+    // key off. parentSpanId is omitted (not emitted) when undefined.
+    spanId: span.spanId,
   }
+  if (span.parentSpanId) metadata.parentSpanId = span.parentSpanId
+  if (span.endpoint) metadata.endpoint = span.endpoint
+  // Drain log lines accumulated on the trace frame since the last
+  // wrapped call (or since `withTrace` opened). Empty array means
+  // either no `withTrace` is active or the user didn't call `log()`.
+  const drainedLogs = drainTraceLogs()
+  if (drainedLogs.length > 0) metadata.logs = drainedLogs
   if (tokens) metadata.tokens = tokens
   if (args.finishReason !== undefined && args.finishReason !== null) {
     metadata.finishReason = args.finishReason
@@ -528,6 +598,8 @@ function wrapStream(
   ctx: InstrumentContext,
   params: ChatCreateParams,
   startedAt: number,
+  span: SpanInfo,
+  onComplete: () => void,
 ): AsyncIterable<ChatChunk> {
   let aggregated = ''
   let tokens: NormalisedTokens | null = null
@@ -549,6 +621,7 @@ function wrapStream(
         toolCalls: snapshotToolCalls(toolCallsAcc),
         modelFromResponse,
         finishReason,
+        span,
       }),
     )
   }
@@ -581,12 +654,16 @@ function wrapStream(
             params,
             startedAt,
             error: err,
+            span,
           }),
         )
         emitted = true
         throw err
       } finally {
         emit()
+        // Restore the trace's previous currentSpanId regardless of
+        // whether the iteration completed cleanly or threw.
+        onComplete()
       }
     },
   }
