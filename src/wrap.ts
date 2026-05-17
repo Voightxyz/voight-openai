@@ -89,10 +89,19 @@ export function wrapOpenAI<T extends object>(
       ? opts.sessionId.trim()
       : randomUUID()
 
+  // routeTag is normalised once at the boundary: trimmed, empty
+  // strings dropped to undefined so the instrument doesn't have to
+  // distinguish between "no tag" and "empty tag".
+  const routeTag =
+    typeof opts.routeTag === 'string' && opts.routeTag.trim().length > 0
+      ? opts.routeTag.trim()
+      : undefined
+
   const ctx: InstrumentContext = {
     agentId,
     privacy: opts.privacy ?? 'standard',
     sessionId,
+    routeTag,
     ingest,
     now: () => Date.now(),
   }

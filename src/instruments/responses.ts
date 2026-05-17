@@ -41,8 +41,15 @@
  * new Responses surface.
  */
 
+import { randomUUID } from 'node:crypto'
+
 import type { EventPayload, PrivacyLevel } from '../types.js'
 import { scrubAnyValue, scrubPii } from '../privacy.js'
+import {
+  drainTraceLogs,
+  getCurrentTrace,
+  pushSpanAndRun,
+} from '../context.js'
 
 // ─── Loose Responses types ────────────────────────────────────────
 
@@ -152,8 +159,31 @@ export interface InstrumentContext {
   agentId: string
   privacy: PrivacyLevel
   sessionId: string
+  /** Optional per-wrapper route / endpoint tag. Trace-level
+   *  `withTrace({ routeTag })` overrides this at call time. */
+  routeTag?: string
   ingest: EventSink
   now: () => number
+}
+
+/**
+ * Resolved span context per intercepted call. Mirrors the structure
+ * used by the chat-completions instrument so the dashboard's span
+ * fields are identical across the two surfaces.
+ */
+interface SpanInfo {
+  spanId: string
+  parentSpanId?: string
+  endpoint?: string
+}
+
+function captureSpanInfo(ctx: InstrumentContext): SpanInfo {
+  const trace = getCurrentTrace()
+  return {
+    spanId: randomUUID(),
+    parentSpanId: trace?.currentSpanId,
+    endpoint: trace?.routeTag ?? ctx.routeTag,
+  }
 }
 
 export function instrumentResponses(
@@ -163,35 +193,47 @@ export function instrumentResponses(
   return async function wrappedCreate(params: ResponseCreateParams) {
     const startedAt = ctx.now()
     const isStream = params.stream === true
+    const span = captureSpanInfo(ctx)
 
-    let result: NonStreamingResponse | AsyncIterable<StreamEvent>
+    if (!isStream) {
+      return pushSpanAndRun(span.spanId, async () => {
+        let result: NonStreamingResponse
+        try {
+          result = (await original(params)) as NonStreamingResponse
+        } catch (err) {
+          ctx.ingest.send(
+            buildFailureEvent({ ctx, params, startedAt, error: err, span }),
+          )
+          throw err
+        }
+        ctx.ingest.send(
+          buildSuccessEvent({ ctx, params, startedAt, response: result, span }),
+        )
+        return result
+      })
+    }
+
+    // Streaming — manually maintain currentSpanId for the iterator's
+    // lifetime so nested wrapped calls during streaming see this call
+    // as their parent. Restoration is finally-safe.
+    const trace = getCurrentTrace()
+    const previousSpanId = trace?.currentSpanId
+    if (trace) trace.currentSpanId = span.spanId
+
+    let result: AsyncIterable<StreamEvent>
     try {
-      result = await original(params)
+      result = (await original(params)) as AsyncIterable<StreamEvent>
     } catch (err) {
+      if (trace) trace.currentSpanId = previousSpanId
       ctx.ingest.send(
-        buildFailureEvent({ ctx, params, startedAt, error: err }),
+        buildFailureEvent({ ctx, params, startedAt, error: err, span }),
       )
       throw err
     }
 
-    if (!isStream) {
-      ctx.ingest.send(
-        buildSuccessEvent({
-          ctx,
-          params,
-          startedAt,
-          response: result as NonStreamingResponse,
-        }),
-      )
-      return result
-    }
-
-    return wrapStream(
-      result as AsyncIterable<StreamEvent>,
-      ctx,
-      params,
-      startedAt,
-    )
+    return wrapStream(result, ctx, params, startedAt, span, () => {
+      if (trace) trace.currentSpanId = previousSpanId
+    })
   }
 }
 
@@ -202,8 +244,9 @@ function buildSuccessEvent(args: {
   params: ResponseCreateParams
   startedAt: number
   response: NonStreamingResponse
+  span: SpanInfo
 }): EventPayload {
-  const { ctx, params, startedAt, response } = args
+  const { ctx, params, startedAt, response, span } = args
   const responseText = extractText(response)
   const toolCalls = extractToolCalls(response.output ?? [])
   const tokens = normaliseTokens(response.usage)
@@ -212,6 +255,7 @@ function buildSuccessEvent(args: {
   return assembleEvent({
     ctx,
     params,
+    span,
     durationMs,
     outcome: 'success',
     responseText: responseText.length > 0 ? responseText : undefined,
@@ -228,13 +272,15 @@ function buildFailureEvent(args: {
   params: ResponseCreateParams
   startedAt: number
   error: unknown
+  span: SpanInfo
 }): EventPayload {
-  const { ctx, params, startedAt, error } = args
+  const { ctx, params, startedAt, error, span } = args
   const durationMs = ctx.now() - startedAt
   const message = error instanceof Error ? error.message : String(error)
   return assembleEvent({
     ctx,
     params,
+    span,
     durationMs,
     outcome: 'failed',
     streaming: params.stream === true,
@@ -251,10 +297,12 @@ function buildStreamEvent(args: {
   toolCalls: CapturedToolCall[] | null
   modelFromResponse: string | undefined
   finishReason: string | null
+  span: SpanInfo
 }): EventPayload {
   return assembleEvent({
     ctx: args.ctx,
     params: args.params,
+    span: args.span,
     durationMs: args.ctx.now() - args.startedAt,
     outcome: 'success',
     responseText:
@@ -270,6 +318,7 @@ function buildStreamEvent(args: {
 function assembleEvent(args: {
   ctx: InstrumentContext
   params: ResponseCreateParams
+  span: SpanInfo
   durationMs: number
   outcome: 'success' | 'failed'
   responseText?: string | undefined
@@ -280,7 +329,7 @@ function assembleEvent(args: {
   errorMessage?: string
   modelFromResponse?: string | undefined
 }): EventPayload {
-  const { ctx, params, durationMs, outcome, streaming, errorMessage } = args
+  const { ctx, params, span, durationMs, outcome, streaming, errorMessage } = args
   const tokens = args.tokens ?? null
   const toolCalls = args.toolCalls ?? null
   const model = args.modelFromResponse ?? params.model
@@ -291,7 +340,12 @@ function assembleEvent(args: {
     privacyLevel: ctx.privacy,
     streaming,
     sessionId: ctx.sessionId,
+    spanId: span.spanId,
   }
+  if (span.parentSpanId) metadata.parentSpanId = span.parentSpanId
+  if (span.endpoint) metadata.endpoint = span.endpoint
+  const drainedLogs = drainTraceLogs()
+  if (drainedLogs.length > 0) metadata.logs = drainedLogs
   if (tokens) metadata.tokens = tokens
   if (args.finishReason !== undefined && args.finishReason !== null) {
     metadata.finishReason = args.finishReason
@@ -443,6 +497,8 @@ function wrapStream(
   ctx: InstrumentContext,
   params: ResponseCreateParams,
   startedAt: number,
+  span: SpanInfo,
+  onComplete: () => void,
 ): AsyncIterable<StreamEvent> {
   const state: StreamState = {
     aggregatedText: '',
@@ -466,6 +522,7 @@ function wrapStream(
         toolCalls: snapshotTools(state.toolEntries),
         modelFromResponse: state.modelFromResponse,
         finishReason: state.finishReason,
+        span,
       }),
     )
   }
@@ -479,12 +536,13 @@ function wrapStream(
         }
       } catch (err) {
         ctx.ingest.send(
-          buildFailureEvent({ ctx, params, startedAt, error: err }),
+          buildFailureEvent({ ctx, params, startedAt, error: err, span }),
         )
         emitted = true
         throw err
       } finally {
         emit()
+        onComplete()
       }
     },
   }
