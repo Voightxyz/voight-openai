@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6] — 2026-05-17
+
+Per-trace tags for per-user spend tracking — the dashboard's AI Apps Users sub-tab and per-user filter pill consume the data this release starts emitting.
+
+### Added
+
+- **`withTrace(fn, { tags })`** — new `tags` option accepts a `Record<string, unknown>` of key-value dimensions stamped on `metadata.tags` of every event emitted in the trace. Canonical use is per-request user identification:
+
+  ```ts
+  withTrace(async () => { ... }, {
+    routeTag: 'POST /api/chat',
+    tags: { userId: req.user.id, plan: req.user.plan, org: req.user.orgId },
+  })
+  ```
+
+  The dashboard can then filter (`?tag.userId=user_123`) or aggregate (top spenders, per-plan rollup) without the SDK having to opine on auth integrations.
+
+### Compatibility
+
+Fully backward-compatible with `0.1.5`. The new `tags` field is optional; callers without it see no change in event shape. Empty `{}` collapses to `undefined` so `metadata.tags: {}` never lands on the wire.
+
+### Tests
+
+- 5 new unit tests in `tests/unit/context.test.ts`: frame attachment, empty-object normalisation, nested-trace isolation, propagation to chat-completions events across multiple wrapped calls, omission when tags aren't supplied.
+- 116/116 tests green (was 111).
+
 ## [0.1.5] — 2026-05-17
 
 Trace-level observability primitives — the dashboard's AI Apps trace drill-down (span tree, Logs sub-tab, endpoint grouping, parent links) now has real data to draw on.

@@ -99,9 +99,50 @@ describe('withTrace — frame lifecycle', () => {
         expect(trace).toBeDefined()
         expect(trace!.logs).toEqual([])
         expect(trace!.routeTag).toBe('POST /api/chat')
+        expect(trace!.tags).toBeUndefined()
         expect(trace!.currentSpanId).toBeUndefined()
       },
       { routeTag: 'POST /api/chat' },
+    )
+  })
+
+  it('attaches supplied tags to the frame for downstream events', async () => {
+    await withTrace(
+      async () => {
+        const trace = getCurrentTrace()
+        expect(trace!.tags).toEqual({
+          userId: 'user_123',
+          plan: 'pro',
+          org: 'acme-corp',
+        })
+      },
+      { tags: { userId: 'user_123', plan: 'pro', org: 'acme-corp' } },
+    )
+  })
+
+  it('drops an empty tags object to undefined (no metadata.tags: {} on events)', async () => {
+    await withTrace(
+      async () => {
+        expect(getCurrentTrace()!.tags).toBeUndefined()
+      },
+      { tags: {} },
+    )
+  })
+
+  it('isolates tags across nested withTrace calls', async () => {
+    await withTrace(
+      async () => {
+        await withTrace(
+          async () => {
+            // Inner frame has its own tags — no inheritance from outer.
+            expect(getCurrentTrace()!.tags).toEqual({ userId: 'inner' })
+          },
+          { tags: { userId: 'inner' } },
+        )
+        // Outer's tags survive after inner exits.
+        expect(getCurrentTrace()!.tags).toEqual({ userId: 'outer' })
+      },
+      { tags: { userId: 'outer' } },
     )
   })
 
@@ -271,6 +312,50 @@ describe('chat-completions × context', () => {
     expect((events[0]!.metadata as Record<string, unknown>).endpoint).toBe(
       'cron:rollup',
     )
+  })
+
+  it('propagates withTrace tags onto metadata.tags of every emitted event', async () => {
+    const { ctx, events } = makeContext()
+    const wrapped = instrumentChatCompletions(
+      (async () => nonStreamingResponse()) as never,
+      ctx,
+    )
+    await withTrace(
+      async () => {
+        await wrapped({
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: 'hi' }],
+        })
+        await wrapped({
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: 'hi again' }],
+        })
+      },
+      {
+        tags: { userId: 'user_alpha', plan: 'pro' },
+      },
+    )
+    // Both events in the same trace carry the same tags.
+    for (const evt of events) {
+      const meta = evt.metadata as Record<string, unknown>
+      expect(meta.tags).toEqual({ userId: 'user_alpha', plan: 'pro' })
+    }
+  })
+
+  it('omits metadata.tags when withTrace is opened without tags', async () => {
+    const { ctx, events } = makeContext()
+    const wrapped = instrumentChatCompletions(
+      (async () => nonStreamingResponse()) as never,
+      ctx,
+    )
+    await withTrace(async () => {
+      await wrapped({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+    })
+    const meta = events[0]!.metadata as Record<string, unknown>
+    expect(meta.tags).toBeUndefined()
   })
 
   it('lets a withTrace routeTag override the wrapper-level routeTag', async () => {

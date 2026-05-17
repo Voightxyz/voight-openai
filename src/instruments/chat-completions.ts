@@ -380,6 +380,12 @@ function assembleEvent(args: {
   }
   if (span.parentSpanId) metadata.parentSpanId = span.parentSpanId
   if (span.endpoint) metadata.endpoint = span.endpoint
+  // Tags propagate from the active trace frame (set via
+  // `withTrace({ tags })`) so the dashboard can filter / aggregate
+  // by user / plan / org / any custom dimension the caller supplies.
+  // Omitted (not stamped) when no trace is active or no tags passed.
+  const trace = getCurrentTrace()
+  if (trace?.tags) metadata.tags = trace.tags
   // Drain log lines accumulated on the trace frame since the last
   // wrapped call (or since `withTrace` opened). Empty array means
   // either no `withTrace` is active or the user didn't call `log()`.

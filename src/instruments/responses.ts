@@ -344,6 +344,11 @@ function assembleEvent(args: {
   }
   if (span.parentSpanId) metadata.parentSpanId = span.parentSpanId
   if (span.endpoint) metadata.endpoint = span.endpoint
+  // Tags from the active trace frame travel with every event so the
+  // dashboard's per-user / per-tier filters work the same way for
+  // Responses API calls as for chat-completions.
+  const trace = getCurrentTrace()
+  if (trace?.tags) metadata.tags = trace.tags
   const drainedLogs = drainTraceLogs()
   if (drainedLogs.length > 0) metadata.logs = drainedLogs
   if (tokens) metadata.tokens = tokens
