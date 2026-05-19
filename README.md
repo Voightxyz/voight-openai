@@ -4,6 +4,19 @@ Voight observability for the OpenAI SDK. Wrap your OpenAI client and capture eve
 
 Same backend and dashboard as [`@voightxyz/anthropic`](https://www.npmjs.com/package/@voightxyz/anthropic). Drop in whichever provider your app uses; events from both land side-by-side under the same agent.
 
+## Quick setup with the wizard
+
+If your app already imports `openai`, the lowest-friction install is the wizard from the main SDK:
+
+```bash
+cd your-app
+npx -y @voightxyz/sdk init
+```
+
+It detects `openai` (and `@anthropic-ai/sdk` if present) in your `package.json`, prompts for a privacy level + Voight key + agent name, and writes a ready-to-import `src/lib/voight.ts` with the wrapped client. 30 seconds, zero copy-paste. Full walkthrough at [docs.voight.xyz/ai-apps/wizard](https://docs.voight.xyz/ai-apps/wizard).
+
+Continue below if you'd rather wire it manually.
+
 ## Install
 
 ```bash
@@ -28,6 +41,41 @@ const response = await client.chat.completions.create({
 ```
 
 That's it — every call is captured automatically. Visit your [Voight dashboard](https://voight.xyz) to see them in real time.
+
+## Tracing & per-user attribution
+
+For production apps where you want to group every LLM call inside one request into one trace, and attribute cost per end-user with one line of code, wrap each request boundary with `withTrace`:
+
+```ts
+import OpenAI from 'openai'
+import { wrapOpenAI, withTrace, log } from '@voightxyz/openai'
+
+const openai = wrapOpenAI(new OpenAI(), {
+  agent: 'production-chat-api',
+  privacy: 'standard',
+})
+
+app.post('/api/chat', async (req, res) => {
+  await withTrace(
+    async () => {
+      log('chat request received')
+      const reply = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: req.body.prompt }],
+      })
+      res.json({ reply })
+    },
+    {
+      routeTag: 'POST /api/chat',
+      tags: { userId: req.user.id, plan: req.user.plan },
+    },
+  )
+})
+```
+
+Every wrapped LLM call inside the `withTrace` block automatically inherits the `routeTag` and `tags`. The `tags.userId` field drives [per-user spend tracking](https://docs.voight.xyz/concepts/per-user-spend) — the dashboard's **Users sub-tab** populates with per-customer cost as soon as your first request lands.
+
+The same `withTrace` exported here also works in [`@voightxyz/anthropic`](https://www.npmjs.com/package/@voightxyz/anthropic) — they share an async-context store, so an app calling both providers inside one request gets one trace, not two.
 
 ## What's captured
 
