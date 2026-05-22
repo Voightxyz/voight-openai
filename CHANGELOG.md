@@ -2,6 +2,52 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.7-beta.1] — 2026-05-22
+
+OpenTelemetry opt-in side-channel.
+
+### Added
+
+- **`wrapOpenAI(client, { otel: true })`** — when set, every
+  captured event is *also* emitted as an OpenTelemetry span with
+  `gen_ai.*` semantic-convention attributes (plus the parallel
+  Vercel-style `ai.*` attributes for cross-compatibility). Picks up
+  whichever `TracerProvider` is registered in the host process, so
+  the wrapper can be used inside an OTel-mandated stack without
+  losing the direct ingestion to `api.voight.xyz`. Pair with
+  Langfuse, Phoenix, Datadog, Sentry, or Voight's own
+  [@voightxyz/vercel-ai](https://www.npmjs.com/package/@voightxyz/vercel-ai)
+  exporter — the wire is the same OTel GenAI semconv every modern
+  LLM observability tool already speaks.
+
+- Emitted spans carry a `voight.source: 'wrapper'` attribute that
+  `@voightxyz/vercel-ai` ≥ 0.1.1 recognises and skips, so users
+  who wire both products into the same process don't see duplicate
+  events.
+
+### Notes
+
+- `@opentelemetry/api` is now an **optional** peer dep. Projects
+  that never set `otel: true` are unaffected — no extra install,
+  no extra runtime cost, behaviour byte-identical to 0.1.6. When
+  `otel: true` is set but `@opentelemetry/api` isn't installed,
+  the wrapper logs a single warning and falls back to direct
+  ingestion only.
+
+- Default `otel: false` ships unchanged — the existing direct
+  ingestion path stays the canonical source of truth and the OTel
+  emission is additive.
+
+- Tests: 116 → 133 green (17 new — pure attribute mapping, span
+  status mapping, error isolation, package-name routing).
+- Validated end-to-end against real OpenAI calls with both a
+  `ConsoleSpanExporter` (verifying the OTel shape) and Voight's
+  own exporter (verifying the dedup loop is closed).
+
+Ships as `@beta` alongside `@voightxyz/anthropic@0.1.8-beta.1`
+and `@voightxyz/vercel-ai@0.1.1-beta.1` for one cycle of registry
+validation before the @latest promotion.
+
 ## [0.1.6] — 2026-05-17
 
 Per-trace tags for per-user spend tracking — the dashboard's AI Apps Users sub-tab and per-user filter pill consume the data this release starts emitting.

@@ -164,6 +164,13 @@ export interface InstrumentContext {
   routeTag?: string
   ingest: EventSink
   now: () => number
+  /**
+   * Optional OTel side-channel. See the matching field on
+   * `InstrumentContext` in `./chat-completions.ts` — same shape,
+   * same semantics, mirrored here because the two instruments
+   * carry independent context types.
+   */
+  emitOtelSpan?: (event: EventPayload) => void
 }
 
 /**
@@ -201,14 +208,26 @@ export function instrumentResponses(
         try {
           result = (await original(params)) as NonStreamingResponse
         } catch (err) {
-          ctx.ingest.send(
-            buildFailureEvent({ ctx, params, startedAt, error: err, span }),
-          )
+          const failureEvent = buildFailureEvent({
+            ctx,
+            params,
+            startedAt,
+            error: err,
+            span,
+          })
+          ctx.ingest.send(failureEvent)
+          ctx.emitOtelSpan?.(failureEvent)
           throw err
         }
-        ctx.ingest.send(
-          buildSuccessEvent({ ctx, params, startedAt, response: result, span }),
-        )
+        const successEvent = buildSuccessEvent({
+          ctx,
+          params,
+          startedAt,
+          response: result,
+          span,
+        })
+        ctx.ingest.send(successEvent)
+        ctx.emitOtelSpan?.(successEvent)
         return result
       })
     }
@@ -225,9 +244,15 @@ export function instrumentResponses(
       result = (await original(params)) as AsyncIterable<StreamEvent>
     } catch (err) {
       if (trace) trace.currentSpanId = previousSpanId
-      ctx.ingest.send(
-        buildFailureEvent({ ctx, params, startedAt, error: err, span }),
-      )
+      const failureEvent = buildFailureEvent({
+        ctx,
+        params,
+        startedAt,
+        error: err,
+        span,
+      })
+      ctx.ingest.send(failureEvent)
+      ctx.emitOtelSpan?.(failureEvent)
       throw err
     }
 
@@ -517,19 +542,19 @@ function wrapStream(
   function emit() {
     if (emitted) return
     emitted = true
-    ctx.ingest.send(
-      buildStreamEvent({
-        ctx,
-        params,
-        startedAt,
-        aggregatedText: state.aggregatedText,
-        tokens: normaliseTokens(state.usage ?? undefined),
-        toolCalls: snapshotTools(state.toolEntries),
-        modelFromResponse: state.modelFromResponse,
-        finishReason: state.finishReason,
-        span,
-      }),
-    )
+    const streamEvent = buildStreamEvent({
+      ctx,
+      params,
+      startedAt,
+      aggregatedText: state.aggregatedText,
+      tokens: normaliseTokens(state.usage ?? undefined),
+      toolCalls: snapshotTools(state.toolEntries),
+      modelFromResponse: state.modelFromResponse,
+      finishReason: state.finishReason,
+      span,
+    })
+    ctx.ingest.send(streamEvent)
+    ctx.emitOtelSpan?.(streamEvent)
   }
 
   return {
@@ -540,9 +565,15 @@ function wrapStream(
           yield ev
         }
       } catch (err) {
-        ctx.ingest.send(
-          buildFailureEvent({ ctx, params, startedAt, error: err, span }),
-        )
+        const failureEvent = buildFailureEvent({
+          ctx,
+          params,
+          startedAt,
+          error: err,
+          span,
+        })
+        ctx.ingest.send(failureEvent)
+        ctx.emitOtelSpan?.(failureEvent)
         emitted = true
         throw err
       } finally {
