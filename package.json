@@ -1,6 +1,6 @@
 {
   "name": "@voightxyz/openai",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Drop-in observability for the OpenAI Node SDK. Wrap your client once and every chat.completions.create and responses.create call lands in Voight: prompts, tokens, cache reads, tool calls, latency, errors.",
   "keywords": [
     "openai",
