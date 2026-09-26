@@ -1,7 +1,7 @@
 {
   "name": "@voightxyz/openai",
   "version": "0.1.7",
-  "description": "Voight observability for the OpenAI SDK. Wrap your OpenAI client and capture every model call — prompts, tokens, costs, latency, errors — surfaced live in the Voight dashboard.",
+  "description": "Drop-in observability for the OpenAI Node SDK. Wrap your client once and every chat.completions.create and responses.create call lands in Voight: prompts, tokens, cache reads, tool calls, latency, errors.",
   "keywords": [
     "openai",
     "observability",
